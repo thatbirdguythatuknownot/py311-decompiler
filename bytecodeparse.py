@@ -130,6 +130,9 @@ def named_expr_deco(func):
         return expr
     return wrapper
 
+def n_extargs(oparg):
+    return (0xFFFFFF < oparg) + (0xFFFF < oparg) + (0xFF < oparg)
+
 # Main classes
 
 class Instr:
@@ -178,7 +181,7 @@ class Instr:
     def __hash__(self: Self) -> int:
         res = ((hash(self.opcode) &
                    (hash(self.oparg_or_arg) ^ self.has_real_arg))
-              ^ hash(self.line_pos) ^ hash(self.col_pos) ^ self.jump_id)
+              ^ hash(self.line_pos) ^ hash(self.col_pos) ^ hash(self.jump_id))
         for instr in self.targeters:
             if instr is not self:
                 res ^= hash(instr)
@@ -303,13 +306,14 @@ class Expr:
 class ExprPrecedenced(Expr):
     __slots__ = ('precedence', 'hs_precedences', 'no_precs')
     
-    __args_attrs__ = ('val',)
-    
-    __fmt_str__ = ""
-    
     precedence: int
     hs_precedences: dict[str, int]
     no_precs: set[str]
+    
+    __fmt_str__ = ""
+    __args_attrs__ = ('val',)
+    
+    val: Expr
     
     def __init_subclass__(cls, **kwargs):
         super(Expr, cls).__init_subclass__(**kwargs)
@@ -370,44 +374,187 @@ class ExprPrecedenced(Expr):
 
 class Constant(ExprPrecedenced):
     precedence = P_ATOM
+    
     def __str__(self: Self) -> str:
         return f"{self.val!r}"
 
 class Name(ExprPrecedenced):
     precedence = P_ATOM
+    
+    __fmt_str__ = "{0}"
+    
     def __str__(self: Self) -> str:
         return f"{self.val}"
+
+class VarUnpack(ExprPrecedenced):
+    precedence = P_EXPR
+    
+    __fmt_str__ = "*{0!s}"
+
+# (T)uple, (L)ist, (S)et Literal
+class TLSLiteral(ExprPrecedenced):
+    precedence = P_ATOM
+    no_precs = ('vals', 'kind')
+    
+    __args_attrs__ = ('vals', 'kind')
+    
+    vals: list[Expr]
+    kind: int
+    
+    def __str__(self: Self) -> str:
+        if self.vals or self.kind != 2:
+            vals_s = ', '.join(map(str, self.vals))
+            if not self.kind and len(self.vals) == 1:
+                vals_s += ','
+            if self.kind or 'no_parens' not in self.extra_info:
+                return (('({})', '[{}]', '{{{}}}')[self.kind]
+                            .format(vals_s))
+            return vals_s
+        return '{*()}'
+
+class DictLiteral(ExprPrecedenced):
+    precedence = P_ATOM
+    no_precs = ('keys', 'vals')
+    
+    __args_attrs__ = ('keys', 'vals')
+    
+    keys: list[Expr | None]
+    vals: list[Expr]
+    
+    def __str__(self: Self) -> str:
+        inner_s = ""
+        for key, val in zip(self.keys, self.vals):
+            if key is not None:
+                key_s = f"{key!s}"
+                if key.precedence < P_TEST:
+                    key_s = f"({key_s})"
+                key_s = f"{key_s}: "
+                val_s = f"{val!s}"
+                if val.precedence < P_TEST:
+                    val_s = f"({val_s})"
+            else:
+                key_s = ""
+                val_s = f"{val!s}"
+                if val.precedence < P_EXPR:
+                    val_s = f"({val_s})"
+                val_s = f"**{val_s}"
+            inner_s = f"{inner_s}, {key_s}{val_s}"
+        return f"{{{inner_s.removeprefix(', ')}}}"
 
 class Attr(ExprPrecedenced):
     precedence = P_ATOM
     no_precs = ('attr',)
+    
     __fmt_str__ = '{0!s}.{1}'
     __args_attrs__ = ('val', 'attr')
+    
+    val: Expr
+    attr: str
 
 class Call(ExprPrecedenced):
     precedence = P_ATOM
     no_precs = ('args', 'kwargs')
-    __args_attrs__ = ('func', 'args', 'kwargs')
+    
+    __args_attrs__ = ('func', 'args', 'keys', 'vals')
+    
+    func: Expr
+    args: list[Expr]
+    keys: tuple[str | None]
+    vals: list[Expr]
+    
     def __str__(self: Self) -> str:
         args_s = ', '.join(map(str, self.args))
-        kwargs_s = ', '.join(f"{x}={y!s}" for x, y in self.kwargs.items())
+        kwargs_s = ""
+        for key, val in zip(self.keys, self.vals):
+            val_s = f"{val!s}"
+            if key is not None:
+                key_s = f"{key}="
+                if val.precedence < P_TEST:
+                    val_s = f"({val_s})"
+            else:
+                key_s = ""
+                if val.precedence < P_EXPR:
+                    val_s = f"({val_s})"
+                val_s = f"**{val_s}"
+            kwargs_s = f"{kwargs_s}, {key_s}{val_s}"
+        kwargs_s = kwargs_s.removeprefix(", ")
         opt_comma = ', ' if args_s and kwargs_s else ''
         return f"{self.func!s}({args_s}{opt_comma}{kwargs_s})"
+
+class Slice(ExprPrecedenced):
+    precedence = P_TEST
+    
+    __args_attrs__ = ('start', 'stop', 'step')
+    
+    start: Expr
+    stop: Expr
+    step: Expr
+    
+    def __str__(self: Self) -> str:
+        start = self.start
+        stop = self.stop
+        step = self.step
+        if not isinstance(start, Constant) or start.val is not None:
+            start_s = f"{start!s}"
+            if start.precedence < self.precedence:
+                start_s = f"({start_s})"
+        else:
+            start_s = ""
+        if not isinstance(stop, Constant) or stop.val is not None:
+            stop_s = f"{stop!s}"
+            if stop.precedence < self.precedence:
+                stop_s = f"({stop_s})"
+        else:
+            stop_s = ""
+        if not isinstance(step, Constant) or step.val is not None:
+            step_s = f"{step!s}"
+            if step.precedence < self.precedence:
+                step_s = f"({step_s})"
+        else:
+            step_s = ""
+        colon_0 = ":"
+        colon_1 = ":" * bool(step_s)
+        return f"{start_s}{colon_0}{stop_s}{colon_1}{step_s}"
+
+class Subscr(ExprPrecedenced):
+    precedence = P_ATOM
+    no_precs = ('slice',)
+    
+    __fmt_str__ = '{0!s}[{1!s}]'
+    __args_attrs__ = ('val', 'slice')
+    
+    val: Expr
+    slice: Expr
 
 class NamedExpr(ExprPrecedenced):
     precedence = P_NAMED_EXPR
     no_precs = ('name',)
+    
     __fmt_str__ = '{1} := {0!s}'
     __args_attrs__ = ('val', 'name')
+    __kwargs_attrs__ = ('kind',)
+    
+    val: Expr
+    name: str
 
 class BinOp(ExprPrecedenced):
     no_precs = ('op',)
+    
     __fmt_str__ = '{0!s} {2} {1!s}'
     __args_attrs__ = ('lhs', 'rhs', 'op')
+    
+    lhs: Expr
+    rhs: Expr
+    op: str
 
 class UnaryOp(ExprPrecedenced):
     no_precs = ('op',)
+    
     __args_attrs__ = ('val', 'op')
+    
+    val: Expr
+    op: str
+    
     def __str__(self: Self) -> str:
         if self.op == 'not':
             return f"not {self.val!s}"
@@ -415,13 +562,22 @@ class UnaryOp(ExprPrecedenced):
 
 class AwaitExpr(ExprPrecedenced):
     precedence = P_AWAIT
+    
     __fmt_str__ = 'await {0!s}'
     __args_attrs__ = ('val',)
+    
+    val: Expr
 
 class CompareOp(ExprPrecedenced):
-    no_precs = ('vals', 'ops')
     precedence = P_CMP
+    no_precs = ('vals', 'ops')
+    
     __args_attrs__ = ('left', 'vals', 'ops')
+    
+    left: Expr
+    vals: list[Expr]
+    ops: list[str]
+    
     def __str__(self: Self) -> str:
         left_s = f"{self.left!s}"
         if self.left.precedence < P_CMP:
@@ -443,13 +599,14 @@ class Bytecode:
     
     Contains 3 attributes:
         .code: CodeType
+        .doc_const: str | None
         .instrs: list[Instr]
         .jumps: list[Instr]
     
     Bytecode(code_: CodeType | FunctionType) -> Bytecode
     """
     
-    __slots__ = ('code', 'instrs', 'jumps')
+    __slots__ = ('code', 'doc_const', 'instrs', 'jumps')
     
     code: CodeType
     instrs: list[Instr]
@@ -459,6 +616,7 @@ class Bytecode:
         if isinstance(code_, FunctionType):
             code_ = code_.__code__
         self.code = code_
+        self.doc_const: str | None = code_.co_consts[0]
         localsplus_names: tuple[str] = code_.co_varnames + code_.co_cellvars
         freevars_start: int = len(localsplus_names)
         localsplus_names += code_.co_freevars
@@ -470,8 +628,9 @@ class Bytecode:
         line_starts: Generator[tuple[int, int],
                                None, None] = findlinestarts(code_)
         offset_jumps: defaultdict[int, list[Instr]] = defaultdict(list)
-        iterator = enumerate(zip(iter_unpack('BB', code_.co_code),
-                                 code_.co_positions()))
+        iterator = enumerate(zip_longest(iter_unpack('BB', code_.co_code),
+                                         code_.co_positions(),
+                                         fillvalue=(0, 0, 0, 0)))
         for BC, ((opcode, oparg), positions) in iterator:
             orig_BC = BC
             while opcode is EXTENDED_ARG:
@@ -534,11 +693,10 @@ class Bytecode:
         self.jumps = jumps
     
     def assemble(self: Self) -> CodeType:
-        jump_delays: defaultdict[int, list[int]] = defaultdict(list)
-        target_positions: dict[int, int] = {}
-        target_poses: set[int] = set()
-        targets_addpos = target_poses.add
-        consts_list: list = []
+        extarg_offs: list[int] = []
+        extarg_off = extarg_offs.append
+        extarg_offlot = extarg_offs.extend
+        consts_list: list = [self.doc_const]
         localsplus_name_lists: tuple[list[str],
                                      list[str],
                                      list[str]] = [], [], []
@@ -549,124 +707,139 @@ class Bytecode:
         code_insert = code_as_list.insert
         instrs: list[Instr] = self.instrs
         
-        # first pass: convert jump/target ids to offsets, convert
-        # non-"real" opargs to "real" opargs
-        BC = 0
+        # first pass: convert non-"real" opargs to "real" opargs
+        cumul_extarg = 0
         for instr in instrs:
             code_append(opcode := instr.opcode)
             num_caches = ICE[opcode]
             if (jump_id := instr.jump_id) is not None:
-                if jump_id in target_positions:
-                    assert instr.opcode in hasjback, \
-                        f"cannot jump backwards with {opname[opcode]}"
-                    code_append(BC - target_positions[jump_id] + 1)
-                else:
-                    jump_delays[jump_id].append(BC + 1)
-                    code_append(-1)
-                
+                code_append(-1)
+                extarg_off(-1)
+                extarg_offlot((0,) * num_caches)
                 code_extend(cache_T * num_caches)
-                BC += num_caches + 1
                 continue
-            if ((target_id := instr.target_id) is not None
-                    and target_id in jump_delays):
-                target_positions[target_id] = BC
-                targets_addpos(BC)
-                for pos in jump_delays.pop(target_id):
-                    code_as_list[pos*2 - 1] = BC - pos
             oparg = instr.oparg_or_arg
             if opcode in hasconst:
-                code_append(list_add(consts_list, oparg))
+                code_append(oparg := list_add(consts_list, oparg))
             elif opcode in haslocal or opcode in hasfree:
                 # we'll do a second pass through the code later
                 # once varnames, cellvars, and freevars are complete
                 list_add(localsplus_name_lists[instr.extra_info['kind']],
                          oparg)
                 code_append(oparg)
+                oparg = 0
             elif opcode is LOAD_GLOBAL:
-                code_append(list_add(names_list, oparg)*2
+                code_append(oparg := list_add(names_list, oparg)*2
                            + instr.extra_info['loads_null'])
             elif opcode in hasname:
-                code_append(list_add(names_list, oparg))
+                code_append(oparg := list_add(names_list, oparg))
             elif opcode is BINARY_OP:
-                code_append(B_ops.index(oparg))
+                code_append(oparg := B_ops.index(oparg))
             elif opcode in hascompare:
-                code_append(C_ops.index(oparg))
+                code_append(oparg := C_ops.index(oparg))
             else:
                 if opcode < HAVE_ARGUMENT:
                     code_append(0)
                 else:
                     code_append(oparg)
+            extarg_off(n_extargs(oparg))
+            extarg_offlot((0,) * num_caches)
             code_extend(cache_T * num_caches)
-            BC += num_caches + 1
-        assert not jump_delays, f"invalid jumps: {[*jump_delays.keys()]}"
         
-        # second pass: convert local/nonlocal names, check for nontranslated
-        # jumps, calculate EXTENDED_ARG offsets, adjust backward jump offsets
+        # second pass: convert local/nonlocal names
         co_varnames: tuple[str] = *localsplus_name_lists[0],
         co_cellvars: tuple[str] = *localsplus_name_lists[1],
         co_freevars: tuple[str] = *localsplus_name_lists[2],
         cellvars_start: int = len(co_varnames)
         freevars_start: int = cellvars_start + len(co_cellvars)
-        bc_numextargs: list[int] = [0] * BC
-        bc_cumul_numextargs: list[int] = [0] * BC
-        total_numextargs = BC = 0
         len_code = len(code_as_list)
         for idx in range(0, len_code, 2):
             opcode = code_as_list[idx]
             oparg = code_as_list[idx + 1]
-            if opcode < HAVE_ARGUMENT:
+            if opcode < HAVE_ARGUMENT and oparg:
                 # just in case
                 code_as_list[idx + 1] = 0
             else:
-                assert oparg != -1, \
+                assert oparg != -1 or opcode in hasj, \
                     f"{opname[opcode]} opcode was not translated"
                 if opcode in haslocal:
                     code_as_list[idx + 1] = oparg = co_varnames.index(oparg)
+                    extarg_offs[idx >> 1] = n_extargs(oparg)
                 elif opcode in hasfree:
                     if self.extra_info['kind'] == 1:
                         oparg = cellvars_start + co_cellvars.index(oparg)
                     else:
                         oparg = freevars_start + co_freevars.index(oparg)
                     code_as_list[idx + 1] = oparg
-                """
-                numextargs = 0
-                ext_oparg: int = oparg
-                while ext_oparg := ext_oparg >> 8:
-                    numextargs += 1
-                if opcode in hasjback:
-                    targetp = BC - oparg + 1
-                    new_oparg = (oparg
-                                + abs(total_numextargs + numextargs
-                                     - bc_cumul_numextargs[targetp]))
-                    new_numextargs = 0
-                    ext_oparg = new_oparg
-                    while ext_oparg := ext_oparg >> 8:
-                        new_numextargs += 1
-                    if new_numextargs > numextargs:
-                        numextargs = new_numextargs
-                    code_as_list[idx + 1] = new_oparg
-                if numextargs:
-                    total_numextargs += numextargs
-                    bc_numextargs[BC] = numextargs
-                    bc_cumul_numextargs[BC] = total_numextargs
-                """
-                assert oparg < 256, \
-                    "assembling EXTENDED_ARGs not yet supported"
-            BC += 1
+                    extarg_offs[idx >> 1] = n_extargs(oparg)
         
-        # third pass: adjust forward jump offsets, final adjustment to all
-        # jump offsets before conversion to EXTENDED_ARG
-        #while idx:
-        #    BC -= 1
-        #    idx -= 2
-        #    if opcode in hasj and not in hasjback:
-        #        
+        # second pass: convert jump/target ids to offsets
+        jump_delays: defaultdict[int, list[int]] = defaultdict(list)
+        target_positions: dict[int, int] = {}
+        BC = 0
+        BC_with_extarg = 0
+        while True:
+            for instr in instrs:
+                num_caches = ICE[opcode := instr.opcode]
+                old_BC = BC
+                loc = BC * 2
+                BC += num_caches + 1
+                if (jump_id := instr.jump_id) is not None:
+                    if jump_id in target_positions:
+                        assert instr.opcode in hasjback, \
+                            f"cannot jump backwards with {opname[opcode]}"
+                        code_as_list[loc + 1] = oparg = \
+                            BC_with_extarg - target_positions[jump_id] + 1
+                        oparg = BC_with_extarg - target_positions[jump_id] + 1
+                        num_extargs = n_extargs(oparg)
+                        old_extargs = extarg_offs[old_BC]
+                        if old_extargs == -1:
+                            extarg_offs[old_BC] = old_extargs = num_extargs
+                        oparg += num_extargs
+                        num_extargs = n_extargs(oparg)
+                        if old_extargs != num_extargs:
+                            extarg_offs[old_BC] = num_extargs
+                            break
+                        code_as_list[loc + 1] = oparg
+                    else:
+                        jump_delays[jump_id].append((old_BC,
+                                                     BC_with_extarg + 1))
+                        num_extargs = extarg_offs[old_BC]
+                        if num_extargs == -1:
+                            num_extargs = 0
+                else:
+                    num_extargs = extarg_offs[old_BC]
+                BC_with_extarg += num_extargs
+                if ((target_id := instr.target_id) is not None
+                        and target_id in jump_delays):
+                    do_break = False
+                    target_positions[target_id] = BC_with_extarg
+                    for pos, off in jump_delays.pop(target_id):
+                        oparg = BC_with_extarg - off
+                        num_extargs = n_extargs(oparg)
+                        old_extargs = extarg_offs[pos]
+                        if old_extargs == -1:
+                            extarg_offs[pos] = num_extargs
+                        elif old_extargs != num_extargs:
+                            extarg_offs[pos] = num_extargs
+                            do_break = True
+                            break
+                        code_as_list[pos*2 + 1] = oparg
+                    if do_break:
+                        break
+                BC_with_extarg += num_caches + 1
+            else:
+                break
+            jump_delays.clear()
+            target_positions.clear()
+            BC_with_extarg = BC = 0
+        assert not jump_delays, f"invalid jumps: {[*jump_delays.keys()]}"
         
-        # fourth pass: add EXTENDED_ARGs, adjust jump offsets, calculate stack
-        # depth, make the line table
+        # fourth pass: add EXTENDED_ARGs, calculate stack depth, make the
+        # line table
         # TODO: calculate max stack depth instead of a linear no-jump path
         # through the code
-        maxdepth = depth = BC = idx = 0
+        maxdepth = depth = BC = idx = idx_noext = 0
         linetable = bytearray()
         linetable_append = linetable.append
         lastline = 1
@@ -689,35 +862,19 @@ class Bytecode:
             if opcode < HAVE_ARGUMENT:
                 oparg = None
             else:
-                """
                 if oparg > 0xFF:
                     ext_oparg = oparg
                     while ext_oparg := ext_oparg >> 8:
                         code_insert(idx, ext_oparg & 0xFF)
                         code_insert(idx, EXTENDED_ARG)
-                    idx += bc_numextargs[BC] * 2
+                    idx += extarg_offs[idx_noext] * 2
                     code_as_list[idx + 1] = oparg & 0xFF
-                """
-                pass
             depth += stack_effect(opcode, oparg, jump=False)
             if depth > maxdepth:
                 maxdepth = depth
             BC += 1
             idx += 2 * (ncaches + 1)
-        
-        # fourth pass: add EXTENDED_ARGs for jump opcodes
-        """
-        maxdepth = depth = idx = 0
-        while idx < len_code:
-            opcode = code_as_list[idx]
-            oparg = code_as_list[idx + 1]
-            if opcode < HAVE_ARGUMENT:
-                oparg = None
-            depth += stack_effect(opcode, oparg, jump=False)
-            if depth > maxdepth:
-                maxdepth = depth
-            idx += 2
-        """
+            idx_noext += ncaches + 1
         
         # assemble the code object
         # TODO: make the exception table
@@ -781,7 +938,76 @@ class BytecodeParser(Bytecode):
         while instr := self.advance():
             pos: int = self.idx - 1
             opcode = instr.opcode
-            if instr.has_real_arg:
+            if (opcode is COMPARE_OP
+                    or opcode is IS_OP
+                    or opcode is CONTAINS_OP):
+                rhs = POP()
+                if opcode is IS_OP:
+                    op = 'is' + ' not' * instr.oparg_or_arg
+                elif opcode is CONTAINS_OP:
+                    op = 'not ' * instr.oparg_or_arg + 'in'
+                    if isinstance(rhs, frozenset):
+                        rhs = TLSLiteral([*map(Constant, rhs)], 2)
+                else:
+                    op = instr.oparg_or_arg
+                possible_SWAP = self.peek(-3)
+                possible_COPY = self.peek(-2)
+                possible_jump = self.peek()
+                # detect a chained comparison:
+                # (load first arg)
+                # (load second arg)
+                # SWAP 2
+                # COPY 2
+                # {COMPARE,IS,CONTAINS}_OP << here
+                # POP_JUMP_FORWARD_IF_FALSE/JUMP_IF_FALSE_OR_POP
+                if (possible_COPY.opcode is COPY
+                        and possible_COPY.oparg_or_arg == 2
+                        and possible_SWAP.opcode is SWAP
+                        and possible_SWAP.oparg_or_arg == 2
+                        and possible_jump.opcode
+                            is POP_JUMP_FORWARD_IF_FALSE
+                            or possible_jump.opcode
+                                is JUMP_IF_FALSE_OR_POP):
+                    jump_id = possible_jump.jump_id
+                    if jump_id in compare_stack:
+                        POP() # pop (first arg) for the jump
+                        _, vals_list, ops_list, _ = \
+                            cmp_info = compare_stack[jump_id]
+                        vals_list.append(rhs)
+                        ops_list.append(op)
+                        cmp_info[3] = len(stack)
+                        continue
+                    # is this check (for the finalizing code) needed?
+                    elif ((target := self.jumps[jump_id]).opcode is SWAP
+                            and target.oparg_or_arg == 2
+                            or
+                            target.opcode is POP_TOP):
+                        left = POP() # pop (very first arg)
+                        self.skip() # skip the jump
+                        compare_stack[jump_id] = \
+                            [left, [rhs], [op], len(stack)]
+                        continue
+                elif compare_stack:
+                    # (dangerous assumption) bytecode structure preceding
+                    # last compare in chained comparisons:
+                    # POP_JUMP_FORWARD_IF_FALSE/JUMP_IF_FALSE_OR_POP
+                    # (load second arg)
+                    # {COMPARE,IS,CONTAINS}_OP
+                    # check for the last jump by checking for the stack
+                    # size; if it's just a 1-difference, it's part of
+                    # the last chain compare
+                    target = next(reversed(compare_stack))
+                    left, vals_list, ops_list, last_ss = compare_stack[target]
+                    # check for 0 because we assigned POP() to `rhs`
+                    if len(stack) - last_ss == 0:
+                        vals_list.append(rhs)
+                        ops_list.append(op)
+                        PUSH(CompareOp(left, vals_list, ops_list))
+                        del compare_stack[target]
+                        skip_ccmp_add(target)
+                        continue
+                stack[-1] = CompareOp(stack[-1], [rhs], [op])
+            elif instr.has_real_arg:
                 if opcode is KW_NAMES:
                     assert not call_shape['kwnames'], \
                         "call_shape has non-empty 'kwnames'"
@@ -805,67 +1031,6 @@ class BytecodeParser(Bytecode):
                                         precedence=U_ops_prec[
                                             instr.oparg_or_arg
                                         ])
-                elif opcode in hascompare:
-                    rhs = POP()
-                    op: str = instr.oparg_or_arg
-                    possible_SWAP = self.peek(-3)
-                    possible_COPY = self.peek(-2)
-                    possible_jump = self.peek()
-                    # detect a chained comparison:
-                    # (load first arg)
-                    # (load second arg)
-                    # SWAP 2
-                    # COPY 2
-                    # COMPARE_OP << here
-                    # POP_JUMP_FORWARD_IF_FALSE/JUMP_IF_FALSE_OR_POP
-                    if (possible_COPY.opcode is COPY
-                            and possible_COPY.oparg_or_arg == 2
-                            and possible_SWAP.opcode is SWAP
-                            and possible_SWAP.oparg_or_arg == 2
-                            and possible_jump.opcode
-                                is POP_JUMP_FORWARD_IF_FALSE
-                                or possible_jump.opcode
-                                    is JUMP_IF_FALSE_OR_POP):
-                        jump_id = possible_jump.jump_id
-                        if jump_id in compare_stack:
-                            POP() # pop (first arg) for the jump
-                            _, vals_list, ops_list, _ = \
-                                cmp_info = compare_stack[jump_id]
-                            vals_list.append(rhs)
-                            ops_list.append(op)
-                            cmp_info[3] = len(stack)
-                            continue
-                        # is this check (for the finalizing code) needed?
-                        elif ((target := self.jumps[jump_id]).opcode is SWAP
-                                and target.oparg_or_arg == 2
-                                or
-                                target.opcode is POP_TOP):
-                            left = POP() # pop (very first arg)
-                            self.skip() # skip the jump
-                            compare_stack[jump_id] = \
-                                [left, [rhs], [op], len(stack)]
-                            continue
-                    elif compare_stack:
-                        # (dangerous assumption) bytecode structure preceding
-                        # last compare in chained comparisons:
-                        # POP_JUMP_FORWARD_IF_FALSE/JUMP_IF_FALSE_OR_POP
-                        # (load second arg)
-                        # COMPARE_OP
-                        # check for the last jump by checking for the stack
-                        # size; if it's just a 1-difference, it's part of
-                        # the last chain compare
-                        target = next(reversed(compare_stack))
-                        left, vals_list, ops_list, last_ss = \
-                            compare_stack[target]
-                        # check for 0 because we assigned POP() to `rhs`
-                        if len(stack) - last_ss == 0:
-                            vals_list.append(rhs)
-                            ops_list.append(op)
-                            PUSH(CompareOp(left, vals_list, ops_list))
-                            del compare_stack[target]
-                            skip_ccmp_add(target)
-                            continue
-                    stack[-1] = CompareOp(stack[-1], [rhs], [op])
             elif (instr.target_id is not None
                     and instr.target_id in skip_cause_compare):
                 skip_ccmp_remove(instr.target_id)
@@ -873,19 +1038,106 @@ class BytecodeParser(Bytecode):
                     self.skip() # instr must be a SWAP 2,
                                 # skip the POP_TOP opcode
                 # we have nothing else to do here
+            elif opcode is BINARY_SUBSCR:
+                item = POP()
+                if isinstance(item, TLSLiteral) and not item.kind:
+                    # setting to None because this is only
+                    # used with a containment check
+                    item.extra_info['no_parens'] = None
+                stack[-1] = Subscr(stack[-1], item)
             elif opcode is PRECALL:
                 # nothing significant to do here
                 pass
             elif opcode is CALL:
                 oparg = instr.oparg_or_arg
                 pargs_len = oparg - len(call_shape['kwnames'])
-                kwargs: dict[str, object] = {}
-                for name, val in zip(call_shape['kwnames'],
-                                     stack[-oparg + pargs_len :]):
-                    kwargs[name] = val
                 res = Call(stack[-oparg - 1],
                            stack[-oparg : -oparg + pargs_len],
-                           kwargs)
+                           call_shape['kwnames'],
+                           stack[-oparg + pargs_len :])
                 call_shape['kwnames'] = ()
                 del stack[-oparg:]
                 stack[-1] = res
+            elif opcode is CALL_FUNCTION_EX:
+                if instr.oparg_or_arg & 1:
+                    kwargs = POP()
+                    kwargs_keys = tuple([key.val if key is not None else None
+                                         for key in kwargs.keys])
+                    kwargs_vals = kwargs.vals
+                else:
+                    kwargs_keys = ()
+                    kwargs_vals = []
+                args = POP()
+                stack[-1] = Call(stack[-1], args.vals, kwargs_keys, kwargs_vals)
+            elif opcode is BUILD_TUPLE:
+                if oparg := instr.oparg_or_arg:
+                    stack[-oparg:] = [TLSLiteral(stack[-oparg:], 0)]
+                else:
+                    PUSH(TLSLiteral([], 0))
+            elif opcode is BUILD_LIST:
+                if oparg := instr.oparg_or_arg:
+                    stack[-oparg:] = [TLSLiteral(stack[-oparg:], 1)]
+                else:
+                    PUSH(TLSLiteral([], 1))
+            elif opcode is BUILD_SET:
+                if oparg := instr.oparg_or_arg:
+                    stack[-oparg:] = [TLSLiteral(stack[-oparg:], 2)]
+                else:
+                    PUSH(TLSLiteral([], 2))
+            elif opcode is BUILD_MAP:
+                if oparg := instr.oparg_or_arg:
+                    oparg *= -2
+                    stack[oparg:] = [DictLiteral(stack[oparg::2],
+                                                  stack[oparg + 1 :: 2])]
+                else:
+                    PUSH(DictLiteral([], []))
+            elif opcode is BUILD_SLICE:
+                if (oparg := instr.oparg_or_arg) == 2:
+                    start = stack[-2]
+                    stop = stack[-1]
+                    step = Constant(None)
+                else:
+                    start = stack[-3]
+                    stop = stack[-2]
+                    step = stack[-1]
+                stack[-oparg:] = [Slice(start, stop, step)]
+            elif opcode is LIST_EXTEND:
+                val = POP()
+                stack[-instr.oparg_or_arg].vals.append(VarUnpack(val))
+            elif opcode is LIST_APPEND:
+                val = POP()
+                stack[-instr.oparg_or_arg].vals.append(val)
+            elif opcode is LIST_TO_TUPLE:
+                stack[-1].kind = 0
+            elif opcode is DICT_MERGE:
+                val = POP()
+                literal: DictLiteral = stack[-instr.oparg_or_arg]
+                if isinstance(val, DictLiteral):
+                    literal.keys.extend(val.keys)
+                    literal.vals.extend(val.vals)
+                else:
+                    literal.keys.append(None)
+                    literal.vals.append(val)
+            elif opcode is DICT_UPDATE:
+                val = POP()
+                key = POP()
+                literal: DictLiteral = stack[-instr.oparg_or_arg]
+                literal.keys.append(key)
+                literal.vals.append(val)
+            elif opcode is PUSH_NULL:
+                # nothing should be pushed here like in LOAD_GLOBAL
+                pass
+            elif opcode is POP_TOP:
+                POP()
+            elif opcode is NOP:
+                pass
+            elif opcode is SWAP:
+                oparg = instr.oparg_or_arg
+                stack[-1], stack[-oparg] = stack[-oparg], stack[-1]
+            elif opcode is COPY:
+                if self.peek().opcode in name_stores:
+                    name_instr = self.advance()
+                    stack[-1] = NamedExpr(stack[-1], name_instr.oparg_or_arg,
+                                          kind=name_stores[name_instr.opcode])
+                else:
+                    PUSH(stack[-instr.oparg_or_arg])
