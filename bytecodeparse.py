@@ -8,7 +8,7 @@ from opcode import (_inline_cache_entries as ICE, HAVE_ARGUMENT,
                     stack_effect)
 from struct import iter_unpack
 from types import CodeType, FunctionType, MemberDescriptorType
-from typing import Generator, Self
+from typing import Generator, Optional, Self
 
 # Constant/initial variables
 
@@ -28,6 +28,9 @@ C_ops = "<", "<=", "==", "!=", ">", ">="
 cache_T: tuple[int, int] = CACHE, 0
 name_stores: dict[int, int] = {STORE_NAME: 0, STORE_GLOBAL: 1,
                                STORE_FAST: 2, STORE_DEREF: 3}
+name_loads: dict[int, int] = {LOAD_NAME: 0, LOAD_GLOBAL: 1,
+                              LOAD_FAST: 2, LOAD_CLOSURE: 2,
+                              LOAD_DEREF: 3, LOAD_CLASSDEREF: 3}
 P_NAMED_EXPR = 0
 P_TUPLE = P_NAMED_EXPR + 1
 P_TEST = P_TUPLE + 1
@@ -126,12 +129,21 @@ def named_expr_deco(func):
                     and (instr := self.peek()).opcode in name_stores):
                 self.skip(2)
                 return NamedExpr(expr, instr.oparg_or_arg,
-                                 kind=name_stores[instr.opcode])
+                                 op_kind=name_stores[instr.opcode])
         return expr
     return wrapper
 
 def n_extargs(oparg):
     return (0xFFFFFF < oparg) + (0xFFFF < oparg) + (0xFF < oparg)
+
+def tag(obj, string):
+    obj.tags.add(string)
+    return obj
+
+# implicitly passes if the tag does not exist
+def untag(obj, string):
+    obj.tags.discard(string)
+    return obj
 
 # Main classes
 
@@ -146,7 +158,7 @@ class Instr:
     opcode: int
     line_pos: tuple[int | None, int | None]
     col_pos: tuple[int | None, int | None]
-    jump_id: int
+    jump_id: int | None
     target_id: int
     has_real_arg: bool
     extra_info: dict # may show up in `.__str__()`, but by default does not
@@ -223,10 +235,10 @@ class Instr:
             jump_s += f" << |{self.target_id}|"
         return f"{pos_s:<38} {opname[self.opcode]:<30}{arg_s}{jump_s}"
 
-class Expr:
+class Stmt:
     __slots__ = ('__dict__', '__fmt_str__', '__args_attrs__',
                  '__kwargs_attrs__', '__defaults__', '__kwdefaults__',
-                 '__start_default__', 'extra_info')
+                 '__start_default__', 'tags', 'extra_info')
     
     __fmt_str__: str # this is not guaranteed to exist
     __args_attrs__: tuple[str]
@@ -234,12 +246,13 @@ class Expr:
     __defaults__: tuple
     __kwdefaults__: dict[str, object]
     __start_default__: int
+    tags: set[str]
     extra_info: dict[str, object]
     
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
         if isinstance(cls.__args_attrs__, MemberDescriptorType):
-            cls.__args_attrs__ = ()
+            cls.__args_attrs__ = ('val',)
         if isinstance(cls.__kwargs_attrs__, MemberDescriptorType):
             cls.__kwargs_attrs__ = ()
         if isinstance(cls.__defaults__, MemberDescriptorType):
@@ -247,14 +260,17 @@ class Expr:
         if isinstance(cls.__kwdefaults__, MemberDescriptorType):
             cls.__kwdefaults__ = {}
         if isinstance(cls.__fmt_str__, MemberDescriptorType):
-            cls.__str__ = cls.__repr__
+            if cls.__str__ is object.__str__:
+                cls.__str__ = cls.__repr__
         cls.__start_default__ = max(
             len(cls.__args_attrs__) - len(cls.__defaults__),
             0
         )
-        if hasattr(cls, '__init__'):
+        if hasattr(cls, '__init__') and not hasattr(cls, '__real_init__'):
             cls.__real_init__ = cls.__init__
             cls.__init__ = lambda self, *args, **kwargs: None
+            if cls.__real_init__ is object.__init__:
+                cls.__real_init__ = cls.__init__
     
     def __new__(cls, *args, **kwargs) -> Self:
         inst = super().__new__(cls)
@@ -286,6 +302,8 @@ class Expr:
                     f"unsupplied keyword argument: {attr}"
                 )
         inst.extra_info = kwargs
+        if not hasattr(inst, 'tags'):
+            inst.tags = set()
         inst.__real_init__(*args, **kwargs)
         return inst
     
@@ -302,6 +320,29 @@ class Expr:
                 self.__args_attrs__ + self.__kwargs_attrs__
             )
         ])
+    
+    def copy(self: Self) -> str:
+        cls = type(self)
+        args = [getattr(self, attr) for attr in cls.__args_attrs__]
+        kwargs = {attr: getattr(self, attr) for attr in cls.__kwargs_attrs__}
+        return cls(*args, **kwargs)
+
+class Assign(Stmt):
+    __args_attrs__ = ("val", "assigns")
+    
+    def __str__(self: Self) -> str:
+        return f"{' = '.join(map(str, self.assigns))} = {self.val!s}"
+
+class BinAssign(Stmt):
+    __fmt_str__ = "{1!s} {2} {0!s}"
+    __args_attrs__ = ("val", "left", "op")
+
+class Return(Stmt):
+    def __str__(self: Self) -> str:
+        return f"return {self.val!s}"
+
+class Expr(Stmt):
+    pass
 
 class ExprPrecedenced(Expr):
     __slots__ = ('precedence', 'hs_precedences', 'no_precs')
@@ -310,8 +351,7 @@ class ExprPrecedenced(Expr):
     hs_precedences: dict[str, int]
     no_precs: set[str]
     
-    __fmt_str__ = ""
-    __args_attrs__ = ('val',)
+    __fmt_str__ = "{0!s}"
     
     val: Expr
     
@@ -334,7 +374,7 @@ class ExprPrecedenced(Expr):
                 cls.__kwdefaults__['precedence'] = 0
         elif not isinstance(hs_precedences, MemberDescriptorType):
             precedence = cls.precedence
-            for attr in self.__args_attrs__:
+            for attr in cls.__args_attrs__:
                 if attr not in no_precs and attr not in hs_precedences:
                     hs_precedences[attr] = precedence
     
@@ -372,6 +412,12 @@ class ExprPrecedenced(Expr):
             return self.__fmt_str__.format(*strings_list)
         return self.__repr__()
 
+class StmtExpr(ExprPrecedenced):
+    precedence = P_TUPLE
+
+class StmtWrap(ExprPrecedenced):
+    precedence = P_TEST
+
 class Constant(ExprPrecedenced):
     precedence = P_ATOM
     
@@ -380,11 +426,7 @@ class Constant(ExprPrecedenced):
 
 class Name(ExprPrecedenced):
     precedence = P_ATOM
-    
-    __fmt_str__ = "{0}"
-    
-    def __str__(self: Self) -> str:
-        return f"{self.val}"
+    no_precs = ('val',)
 
 class VarUnpack(ExprPrecedenced):
     precedence = P_EXPR
@@ -528,11 +570,11 @@ class Subscr(ExprPrecedenced):
 
 class NamedExpr(ExprPrecedenced):
     precedence = P_NAMED_EXPR
+    hs_precedences = {'val': P_TEST}
     no_precs = ('name',)
     
     __fmt_str__ = '{1} := {0!s}'
     __args_attrs__ = ('val', 'name')
-    __kwargs_attrs__ = ('kind',)
     
     val: Expr
     name: str
@@ -559,6 +601,34 @@ class UnaryOp(ExprPrecedenced):
         if self.op == 'not':
             return f"not {self.val!s}"
         return f"{self.op}{self.val!s}"
+
+class BoolOp(ExprPrecedenced):
+    precedence = P_AND
+    no_precs = ('bkind',)
+    
+    __args_attrs__ = ('vals', 'bkind')
+    
+    vals: list[Expr]
+    bkind: bool | type(...) | None
+    
+    def __init__(self, vals, bkind) -> Self:
+        if not bkind:
+            self.precedence = P_OR
+    
+    def __str__(self: Self) -> str:
+        sep = " and " if self.bkind else " or "
+        vals_it = iter(self.vals)
+        exp = next(vals_it)
+        if exp.precedence < self.precedence:
+            res = f"({exp!s})"
+        else:
+            res = f"{exp!s}"
+        for exp in vals_it:
+            if exp.precedence < self.precedence:
+                res = f"{res}{sep}({exp!s})"
+            else:
+                res = f"{res}{sep}{exp!s}"
+        return res
 
 class AwaitExpr(ExprPrecedenced):
     precedence = P_AWAIT
@@ -921,7 +991,7 @@ class BytecodeParser(Bytecode):
         except IndexError:
             return None
     
-    def decompile_expr(self: Self) -> Expr | None:
+    def decompile_expr(self: Self) -> None:
         stack = self.stack
         PUSH = self.spush
         POP = self.spop
@@ -935,9 +1005,27 @@ class BytecodeParser(Bytecode):
         skip_ccmp_remove = skip_cause_compare.remove
         cPOP = compare_stack.pop
         compare_popitem = compare_stack.popitem
+        boolop_stack: list[tuple[bool, list, Optional[int]]] = []
+        bPUSH = boolop_stack.append
+        bPOP = boolop_stack.pop
+        boolop_jumps: set[int] = set()
+        bjump_add = boolop_jumps.add
+        bjump_remove = boolop_jumps.remove
+        target_is_boolop_expr: list[int] = []
+        bexprPUSH = target_is_boolop_expr.append
+        bexprPOP = target_is_boolop_expr.pop
+        jumplead_bexpr: dict[int] = {}
+        instr: Instr | None = None
         while instr := self.advance():
-            pos: int = self.idx - 1
             opcode = instr.opcode
+            if boolop_jumps and instr.target_id in boolop_jumps:
+                bjump_remove(instr.target_id)
+                val = stack[-1]
+                while boolop_stack:
+                    bkind, vals = bPOP()
+                    vals.append(val)
+                    val = BoolOp(vals, bkind)
+                stack[-1] = val
             if (opcode is COMPARE_OP
                     or opcode is IS_OP
                     or opcode is CONTAINS_OP):
@@ -1017,10 +1105,13 @@ class BytecodeParser(Bytecode):
                 elif opcode is LOAD_ATTR or opcode is LOAD_METHOD:
                     stack[-1] = Attr(stack[-1], instr.oparg_or_arg)
                 elif opcode is LOAD_GLOBAL:
-                    PUSH(Name(instr.oparg_or_arg))
-                elif 'LOAD' in opname[opcode]:
-                    PUSH(Name(instr.oparg_or_arg, **instr.extra_info))
+                    PUSH(Name(instr.oparg_or_arg, op_kind=1))
+                elif opcode in name_loads:
+                    PUSH(Name(instr.oparg_or_arg, op_kind=name_loads[opcode],
+                              **instr.extra_info))
                 elif opcode is BINARY_OP:
+                    if instr.oparg_or_arg not in B_ops_prec:
+                        return instr
                     rhs = POP()
                     stack[-1] = BinOp(stack[-1], rhs, instr.oparg_or_arg,
                                       precedence=B_ops_prec[
@@ -1031,6 +1122,8 @@ class BytecodeParser(Bytecode):
                                         precedence=U_ops_prec[
                                             instr.oparg_or_arg
                                         ])
+                else:
+                    break
             elif (instr.target_id is not None
                     and instr.target_id in skip_cause_compare):
                 skip_ccmp_remove(instr.target_id)
@@ -1138,6 +1231,196 @@ class BytecodeParser(Bytecode):
                 if self.peek().opcode in name_stores:
                     name_instr = self.advance()
                     stack[-1] = NamedExpr(stack[-1], name_instr.oparg_or_arg,
-                                          kind=name_stores[name_instr.opcode])
+                                          op_kind=
+                                            name_stores[name_instr.opcode],
+                                          **name_instr.extra_info)
                 else:
-                    PUSH(stack[-instr.oparg_or_arg])
+                    PUSH(tag(stack[-instr.oparg_or_arg].copy(), 'copy'))
+            elif opcode is JUMP_IF_FALSE_OR_POP:
+                val = POP()
+                if boolop_stack:
+                    bkind, vals, *_ = boolop_stack[-1]
+                    while bkind is not True and bkind is not False:
+                        vals.append(val)
+                        val = BoolOp(vals, bkind)
+                        bPOP()
+                        bkind, vals, *_ = boolop_stack[-1]
+                    if bkind:
+                        vals.append(val)
+                        continue
+                bPUSH((True, [val]))
+                bjump_add(instr.jump_id)
+            elif opcode is JUMP_IF_TRUE_OR_POP:
+                val = POP()
+                if boolop_stack:
+                    bkind, vals, *_ = boolop_stack[-1]
+                    while bkind is not True and bkind is not False:
+                        vals.append(val)
+                        val = BoolOp(vals, bkind)
+                        bPOP()
+                        bkind, vals, *_ = boolop_stack[-1]
+                    if not bkind:
+                        vals.append(val)
+                        continue
+                bPUSH((False, [val]))
+                bjump_add(instr.jump_id)
+            elif (opcode is POP_JUMP_FORWARD_IF_FALSE
+                    or opcode is POP_JUMP_FORWARD_IF_TRUE):
+                if instr.jump_id not in jumplead_bexpr:
+                    i = instr.jump_id
+                    j = self.idx
+                    len_jumps = len(jumps := self.jumps)
+                    len_instrs = len(instrs := self.instrs)
+                    while i < len_jumps:
+                        inst = jumps[i]
+                        while j < len_instrs:
+                            if instrs[j] is inst:
+                                break
+                            j += 1
+                        else:
+                            jumplead_bexpr[instr.jump_id] = \
+                            jumplead_bexpr[i] = False
+                            break
+                        inst = instrs[j - 1]
+                        if (inst.opcode is JUMP_IF_FALSE_OR_POP or
+                                inst.opcode is JUMP_IF_TRUE_OR_POP):
+                            jumplead_bexpr[instr.jump_id] = \
+                            jumplead_bexpr[i] = True
+                            break
+                        elif inst is instr or inst.jump_id is None:
+                            jumplead_bexpr[instr.jump_id] = \
+                            jumplead_bexpr[i] = False
+                            break
+                        i = inst.jump_id
+                    else:
+                        jumplead_bexpr[instr.jump_id] = \
+                        jumplead_bexpr[i] = False
+                if not jumplead_bexpr[instr.jump_id]:
+                    break
+                val = POP()
+                op_bkind = (
+                    ...
+                    if opcode is POP_JUMP_FORWARD_IF_FALSE else
+                    None
+                )
+                if boolop_stack:
+                    bkind = boolop_stack[-1][0]
+                    if bkind is not True and bkind is not False:
+                        do_collapse = True
+                        targid = self.peek().target_id
+                        lastn = 1
+                        while (lastn <= len(boolop_stack)
+                                and len(boolop_stack[-lastn]) > 2):
+                            if boolop_stack[-lastn][2] == targid:
+                                break
+                            lastn += 1
+                        else:
+                            do_collapse = False
+                        if do_collapse:
+                            while lastn:
+                                bkind, vals, tid = bPOP()
+                                vals.append(val)
+                                val = BoolOp(vals, bkind)
+                                lastn -= 1
+                        elif op_bkind is not bkind:
+                            bPUSH((op_bkind, [val], instr.jump_id))
+                            continue
+                        boolop_stack[-1][1].append(val)
+                        continue
+                bPUSH((op_bkind, [val], instr.jump_id))
+            else:
+                break
+        if boolop_stack:
+            val = stack[-1]
+            while boolop_stack:
+                bkind, vals = bPOP()
+                vals.append(val)
+                val = BoolOp(vals, bkind)
+            stack[-1] = val
+        return instr
+    
+    def decompile_stmt(self: Self) -> Stmt | None:
+        stack = self.stack
+        PUSH = self.spush
+        POP = self.spop
+        assign_list: list[Expr] | None = None
+        stack_unpack: list[list[int, list[Expr]]] = []
+        while True:
+            instr = self.decompile_expr()
+            if instr is None:
+                break
+            opcode = instr.opcode
+            if opcode is POP_TOP:
+                return StmtExpr(POP())
+            elif opcode in name_stores:
+                node = Name(instr.oparg_or_arg, op_kind=name_stores[opcode],
+                            **instr.extra_info)
+            elif opcode is STORE_ATTR:
+                node = Attr(POP(), instr.oparg_or_arg)
+            elif opcode is STORE_SUBSCR:
+                sub = POP()
+                node = Subscr(POP(), sub, instr.oparg_or_arg)
+            elif opcode is UNPACK_SEQUENCE:
+                n = instr.oparg_or_arg
+                stack_unpack.append([n, [], None, 0])
+                if n:
+                    continue
+            elif opcode is UNPACK_EX:
+                n = instr.oparg_or_arg
+                stack_unpack.append([n & 0xFF, [], False, n >> 8])
+                continue
+            elif opcode is BINARY_OP:
+                node = POP()
+                if isinstance(node, Subscr):
+                    self.idx += 3
+                elif isinstance(node, Attr):
+                    self.idx += 2
+                else:
+                    self.idx += 1
+                return BinAssign(StmtWrap(node), POP(), instr.oparg_or_arg)
+            elif opcode is RETURN_VALUE:
+                return Return(StmtWrap(POP()))
+            elif opcode is RESUME:
+                continue
+            else:
+                break
+            backed = False
+            while stack_unpack:
+                info = stack_unpack[-1]
+                if info[0]:
+                    info[1].append(node)
+                    info[0] -= 1
+                    if info[0] or info[2] is False:
+                        break
+                elif info[2] is False:
+                    info[1].append(VarUnpack(node))
+                    info[2] = True
+                    info[0] = info[3]
+                    if info[0]:
+                        break
+                else:
+                    if backed:
+                        raise ValueError(
+                            f"empty stack unprocessed: {info[1]}"
+                        )
+                stack_unpack.pop()
+                els = info[1]
+                node = TLSLiteral(els, 0)
+                if not stack_unpack and els:
+                    node.extra_info['no_parens'] = True
+                backed = True
+            else:
+                el = POP()
+                if 'copy' in el.tags:
+                    if not assign_list:
+                        assign_list = [node]
+                    else:
+                        assign_list.append(node)
+                else:
+                    if assign_list:
+                        assign_list.append(node)
+                        arg = assign_list
+                        assign_list = None
+                    else:
+                        arg = [node]
+                    return Assign(StmtWrap(el), arg)
