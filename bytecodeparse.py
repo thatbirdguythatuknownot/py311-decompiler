@@ -6,6 +6,7 @@ from opcode import (_inline_cache_entries as ICE, HAVE_ARGUMENT,
                     _nb_ops as B_ops, hascompare, hasconst, hasfree,
                     hasjrel as hasj, haslocal, hasname, opmap, opname,
                     stack_effect)
+from pprint import pprint
 from struct import iter_unpack
 from types import CodeType, FunctionType, MemberDescriptorType
 from typing import Generator, Optional, Self
@@ -20,6 +21,8 @@ hasconst: set[int] = {*hasconst}
 hasfree: set[int] = {*hasfree}
 hasj: set[int] = {*hasj} - {LOAD_GLOBAL}
 hasjback: set[int] = {x for x in hasj if 'BACKWARD' in opname[x]}
+hasjbool: set[int] = {JUMP_IF_FALSE_OR_POP, JUMP_IF_TRUE_OR_POP,
+                      POP_JUMP_FORWARD_IF_FALSE, POP_JUMP_FORWARD_IF_TRUE}
 haslocal: set[int] = {*haslocal}
 hasname: set[int] = {*hasname}
 U_ops: dict[int, str] = {UNARY_POSITIVE: '+', UNARY_NEGATIVE: '-',
@@ -598,9 +601,13 @@ class UnaryOp(ExprPrecedenced):
     op: str
     
     def __str__(self: Self) -> str:
+        if self.val.precedence < self.precedence:
+            val_s = f"({self.val!s})"
+        else:
+            val_s = f"{self.val!s}"
         if self.op == 'not':
-            return f"not {self.val!s}"
-        return f"{self.op}{self.val!s}"
+            return f"not {val_s}"
+        return f"{self.op}{val_s}"
 
 class BoolOp(ExprPrecedenced):
     precedence = P_AND
@@ -611,7 +618,8 @@ class BoolOp(ExprPrecedenced):
     vals: list[Expr]
     bkind: bool | type(...) | None
     
-    def __init__(self, vals, bkind) -> Self:
+    def __init__(self, vals, bkind, **kwargs) -> Self:
+        super().__init__(vals, bkind, **kwargs)
         if not bkind:
             self.precedence = P_OR
     
@@ -727,7 +735,7 @@ class Bytecode:
             elif opcode is BINARY_OP:
                 oparg = B_ops[oparg]
             elif opcode in U_ops:
-                oparg = U_ops[oparg]
+                oparg = U_ops[opcode]
             elif opcode in hascompare:
                 oparg = C_ops[oparg]
             else:
@@ -960,10 +968,11 @@ class Bytecode:
                         co_freevars, co_cellvars)
 
 class BytecodeParser(Bytecode):
-    __slots__ = ('__dict__', 'idx', 'stack', 'call_shape')
+    __slots__ = ('__dict__', 'idx', 'stack', 'jumplead_bexpr', 'call_shape')
     
     idx: int
     stack: list[Expr]
+    jumplead_bexpr: list[bool]
     call_shape: dict[str, object]
     
     def __init__(self, *args, **kwargs) -> None:
@@ -973,6 +982,41 @@ class BytecodeParser(Bytecode):
         self.spush = self.stack.append
         self.spop = self.stack.pop
         self.call_shape = {'kwnames': ()}
+        len_jumps = len(jumps := self.jumps)
+        len_instrs = len(instrs := self.instrs)
+        self.jumplead_bexpr = jumplead_bexpr = [None] * len_jumps
+        indices: set[int] = {*range(len_jumps)}
+        j = 0
+        while True:
+            try:
+                i = min(indices)
+            except ValueError:
+                break
+            tempset: set[int] = set()
+            verdict: bool | None = False
+            while True:
+                tempset.add(i)
+                inst = jumps[i]
+                while j < len_instrs:
+                    if instrs[j] is inst:
+                        break
+                    j += 1
+                else:
+                    break
+                inst = instrs[j - 1]
+                if (inst.opcode is JUMP_IF_FALSE_OR_POP or
+                        inst.opcode is JUMP_IF_TRUE_OR_POP):
+                    verdict = True
+                    break
+                elif inst.jump_id == i:
+                    break
+                elif inst.opcode not in hasjbool:
+                    verdict = None
+                    break
+                i = inst.jump_id
+            indices -= tempset
+            for index in tempset:
+                jumplead_bexpr[index] = verdict
     
     def advance(self: Self) -> Instr | None:
         try:
@@ -1006,26 +1050,40 @@ class BytecodeParser(Bytecode):
         cPOP = compare_stack.pop
         compare_popitem = compare_stack.popitem
         boolop_stack: list[tuple[bool, list, Optional[int]]] = []
-        bPUSH = boolop_stack.append
-        bPOP = boolop_stack.pop
+        len_boolop_stack = 0
+        def bPUSH(x):
+            nonlocal len_boolop_stack
+            boolop_stack.append(x)
+            len_boolop_stack += 1
+        def bPOP(n=-1):
+            nonlocal len_boolop_stack
+            len_boolop_stack -= 1
+            return boolop_stack.pop(n)
         boolop_jumps: set[int] = set()
         bjump_add = boolop_jumps.add
         bjump_remove = boolop_jumps.remove
-        target_is_boolop_expr: list[int] = []
-        bexprPUSH = target_is_boolop_expr.append
-        bexprPOP = target_is_boolop_expr.pop
-        jumplead_bexpr: dict[int] = {}
         instr: Instr | None = None
         while instr := self.advance():
             opcode = instr.opcode
-            if boolop_jumps and instr.target_id in boolop_jumps:
-                bjump_remove(instr.target_id)
-                val = stack[-1]
-                while boolop_stack:
-                    bkind, vals = bPOP()
-                    vals.append(val)
-                    val = BoolOp(vals, bkind)
-                stack[-1] = val
+            if instr.target_id is not None:
+                if self.peek(-2).opcode in hasjbool and len_boolop_stack > 1:
+                    vals = boolop_stack[-1][1]
+                    assert len(vals) == 1, "?? (-2 peek)"
+                    val = vals[0]
+                    while (len_boolop_stack > 1
+                            and boolop_stack[-2][2] == instr.target_id):
+                        bkind, vals, id = bPOP(-2)
+                        vals.append(val)
+                        val = BoolOp(vals, bkind)
+                    boolop_stack[-1][1][0] = val
+                if stack:
+                    val = stack[-1]
+                    while (boolop_stack
+                            and boolop_stack[-1][2] == instr.target_id):
+                        bkind, vals, id = bPOP()
+                        vals.append(val)
+                        val = BoolOp(vals, bkind)
+                    stack[-1] = val
             if (opcode is COMPARE_OP
                     or opcode is IS_OP
                     or opcode is CONTAINS_OP):
@@ -1220,8 +1278,6 @@ class BytecodeParser(Bytecode):
             elif opcode is PUSH_NULL:
                 # nothing should be pushed here like in LOAD_GLOBAL
                 pass
-            elif opcode is POP_TOP:
-                POP()
             elif opcode is NOP:
                 pass
             elif opcode is SWAP:
@@ -1238,64 +1294,19 @@ class BytecodeParser(Bytecode):
                     PUSH(tag(stack[-instr.oparg_or_arg].copy(), 'copy'))
             elif opcode is JUMP_IF_FALSE_OR_POP:
                 val = POP()
-                if boolop_stack:
-                    bkind, vals, *_ = boolop_stack[-1]
-                    while bkind is not True and bkind is not False:
-                        vals.append(val)
-                        val = BoolOp(vals, bkind)
-                        bPOP()
-                        bkind, vals, *_ = boolop_stack[-1]
-                    if bkind:
-                        vals.append(val)
-                        continue
-                bPUSH((True, [val]))
-                bjump_add(instr.jump_id)
+                if boolop_stack and boolop_stack[-1][0] is True:
+                    boolop_stack[-1][1].append(val)
+                else:
+                    bPUSH((True, [val], instr.jump_id))
             elif opcode is JUMP_IF_TRUE_OR_POP:
                 val = POP()
-                if boolop_stack:
-                    bkind, vals, *_ = boolop_stack[-1]
-                    while bkind is not True and bkind is not False:
-                        vals.append(val)
-                        val = BoolOp(vals, bkind)
-                        bPOP()
-                        bkind, vals, *_ = boolop_stack[-1]
-                    if not bkind:
-                        vals.append(val)
-                        continue
-                bPUSH((False, [val]))
-                bjump_add(instr.jump_id)
+                if boolop_stack and boolop_stack[-1][0] is False:
+                    boolop_stack[-1][1].append(val)
+                else:
+                    bPUSH((False, [val], instr.jump_id))
             elif (opcode is POP_JUMP_FORWARD_IF_FALSE
                     or opcode is POP_JUMP_FORWARD_IF_TRUE):
-                if instr.jump_id not in jumplead_bexpr:
-                    i = instr.jump_id
-                    j = self.idx
-                    len_jumps = len(jumps := self.jumps)
-                    len_instrs = len(instrs := self.instrs)
-                    while i < len_jumps:
-                        inst = jumps[i]
-                        while j < len_instrs:
-                            if instrs[j] is inst:
-                                break
-                            j += 1
-                        else:
-                            jumplead_bexpr[instr.jump_id] = \
-                            jumplead_bexpr[i] = False
-                            break
-                        inst = instrs[j - 1]
-                        if (inst.opcode is JUMP_IF_FALSE_OR_POP or
-                                inst.opcode is JUMP_IF_TRUE_OR_POP):
-                            jumplead_bexpr[instr.jump_id] = \
-                            jumplead_bexpr[i] = True
-                            break
-                        elif inst is instr or inst.jump_id is None:
-                            jumplead_bexpr[instr.jump_id] = \
-                            jumplead_bexpr[i] = False
-                            break
-                        i = inst.jump_id
-                    else:
-                        jumplead_bexpr[instr.jump_id] = \
-                        jumplead_bexpr[i] = False
-                if not jumplead_bexpr[instr.jump_id]:
+                if not self.jumplead_bexpr[instr.jump_id]:
                     break
                 val = POP()
                 op_bkind = (
@@ -1303,37 +1314,16 @@ class BytecodeParser(Bytecode):
                     if opcode is POP_JUMP_FORWARD_IF_FALSE else
                     None
                 )
-                if boolop_stack:
-                    bkind = boolop_stack[-1][0]
-                    if bkind is not True and bkind is not False:
-                        do_collapse = True
-                        targid = self.peek().target_id
-                        lastn = 1
-                        while (lastn <= len(boolop_stack)
-                                and len(boolop_stack[-lastn]) > 2):
-                            if boolop_stack[-lastn][2] == targid:
-                                break
-                            lastn += 1
-                        else:
-                            do_collapse = False
-                        if do_collapse:
-                            while lastn:
-                                bkind, vals, tid = bPOP()
-                                vals.append(val)
-                                val = BoolOp(vals, bkind)
-                                lastn -= 1
-                        elif op_bkind is not bkind:
-                            bPUSH((op_bkind, [val], instr.jump_id))
-                            continue
-                        boolop_stack[-1][1].append(val)
-                        continue
-                bPUSH((op_bkind, [val], instr.jump_id))
+                if boolop_stack and boolop_stack[-1][0] is op_bkind:
+                    boolop_stack[-1][1].append(val)
+                else:
+                    bPUSH((op_bkind, [val], instr.jump_id))
             else:
                 break
         if boolop_stack:
             val = stack[-1]
             while boolop_stack:
-                bkind, vals = bPOP()
+                bkind, vals, _, *ext = bPOP()
                 vals.append(val)
                 val = BoolOp(vals, bkind)
             stack[-1] = val
