@@ -6,7 +6,6 @@ from opcode import (_inline_cache_entries as ICE, HAVE_ARGUMENT,
                     _nb_ops as B_ops, hascompare, hasconst, hasfree,
                     hasjrel as hasj, haslocal, hasname, opmap, opname,
                     stack_effect)
-from pprint import pprint
 from struct import iter_unpack
 from types import CodeType, FunctionType, MemberDescriptorType
 from typing import Generator, Optional, Self
@@ -1201,11 +1200,13 @@ class BytecodeParser(Bytecode):
                 pass
             elif opcode is CALL:
                 oparg = instr.oparg_or_arg
-                pargs_len = oparg - len(call_shape['kwnames'])
-                res = Call(stack[-oparg - 1],
-                           stack[-oparg : -oparg + pargs_len],
+                pargs_end = -len(call_shape['kwnames'])
+                if not pargs_end:
+                    pargs_end = None
+                res = Call(stack[~oparg],
+                           stack[-oparg : pargs_end],
                            call_shape['kwnames'],
-                           stack[-oparg + pargs_len :])
+                           stack[pargs_end :])
                 call_shape['kwnames'] = ()
                 del stack[-oparg:]
                 stack[-1] = res
