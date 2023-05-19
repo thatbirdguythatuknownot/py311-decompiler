@@ -8,7 +8,7 @@ from opcode import (_inline_cache_entries as ICE, HAVE_ARGUMENT,
                     stack_effect)
 from struct import iter_unpack
 from types import CodeType, FunctionType, MemberDescriptorType
-from typing import Generator, Optional, Self
+from typing import Any, Generator, Optional, Self
 
 # Constant/initial variables
 
@@ -246,10 +246,10 @@ class Stmt:
     __args_attrs__: tuple[str]
     __kwargs_attrs__: tuple[str]
     __defaults__: tuple
-    __kwdefaults__: dict[str, object]
+    __kwdefaults__: dict[str, Any]
     __start_default__: int
     tags: set[str]
-    extra_info: dict[str, object]
+    extra_info: dict[str, Any]
     
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
@@ -972,7 +972,7 @@ class BytecodeParser(Bytecode):
     idx: int
     stack: list[Expr]
     jumplead_bexpr: list[bool]
-    call_shape: dict[str, object]
+    call_shape: dict[str, Any]
     
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
