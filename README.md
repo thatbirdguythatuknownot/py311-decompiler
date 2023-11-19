@@ -78,7 +78,7 @@ def a():
     return b
 
 parser = BytecodeParser(a) # can also use a `code` instance as the argument
-for stmt in parser.decompile_stmt():
+while stmt := parser.decompile_stmt():
     # stmt should be an AST-like object
     print(stmt)
 ```
